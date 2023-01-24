@@ -6,6 +6,7 @@
 #include <linux/slab.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
+#include <linux/mutex.h>
 
 //Device details 
 #define DEVICE_NAME "litechr"
@@ -37,7 +38,9 @@ struct data_queue_entry_t {
 };
 
 static LIST_HEAD(data_queue_head);
-static struct list_head *pdata_queue_tail = &data_queue_head;
+static struct list_head *pdata_queue_tail;
+static size_t data_queue_size;
+static struct mutex data_queue_mtx;
 
 //static struct data_queue_entry_t data_queue;
 
@@ -47,6 +50,9 @@ static int __init litechr_init(void)
     int ret;
     struct device *pdevice_pcd;
 
+    pdata_queue_tail = &data_queue_head;
+    data_queue_size = 0;
+ 
     // Allocate device number with a single minor number
     if ((ret = alloc_chrdev_region(&litechr_dev, 0, 1, DEVICE_NAME)) < 0) {
         pr_err("Failed to allocate device number\n");
@@ -83,6 +89,8 @@ static int __init litechr_init(void)
 	goto un_add;
     }
  
+    mutex_init(&data_queue_mtx);
+
     pr_info("Linux Character Driver successfully initialized\n");
 
     return 0;
@@ -104,6 +112,7 @@ static void __exit litechr_exit(void)
 {
     struct data_queue_entry_t *pentry, *ptentry;
     size_t count = 0;
+
     list_for_each_entry_safe(pentry, ptentry, &data_queue_head, entry_head) {
         list_del(&pentry->entry_head);
         kfree(pentry);
@@ -128,8 +137,13 @@ static void __exit litechr_exit(void)
 
 static int litechr_open(struct inode *pinode, struct file *pfile)
 {
-    //TODO: Add your code here
- 
+    if (pfile->f_flags & O_EXCL)
+        pr_info("Opened in exclusive mode\n");
+    if (pfile->f_flags & O_CREAT)
+        pr_info("Opened with create flag\n");
+    if (pfile->f_flags & O_TRUNC)
+        pr_info("Opened with truncate flag\n");
+
     return 0;
 }
 
@@ -146,19 +160,24 @@ static ssize_t litechr_read(struct file *pfile, char *ubuf, size_t length, loff_
     char *kbuf;
     struct data_queue_entry_t *pentry;
 
-    if (*poffset != 0)
-        return -ESPIPE;
+    //if (*poffset != 0)
+    //    return -ESPIPE;
     if (length == 0)
         return -EINVAL;
     if (ubuf == NULL)
         return -EINVAL;
     
-    kbuf = kmalloc(MAX_BUF_SIZE, GFP_KERNEL);
-    if (kbuf == NULL)
+    mutex_lock(&data_queue_mtx);
+
+    length = min(length, data_queue_size);
+    
+    kbuf = kmalloc(length, GFP_KERNEL);
+    if (kbuf == NULL) {
+        mutex_unlock(&data_queue_mtx);
         return -ENOMEM;
+    }
 
     pr_info("Sending data: ");
-
     for (   buf_len = 0;
             buf_len < length && !list_empty(pdata_queue_tail);
             ++buf_len ) {
@@ -166,10 +185,13 @@ static ssize_t litechr_read(struct file *pfile, char *ubuf, size_t length, loff_
         kbuf[buf_len] = pentry->data_byte;
         pdata_queue_tail = pdata_queue_tail->next;
         list_del(&pentry->entry_head);
+	data_queue_size--;
         kfree(pentry);
         pr_cont("%c (0x%02X) ", kbuf[buf_len], kbuf[buf_len]);
     }
     pr_info("");
+
+    mutex_unlock(&data_queue_mtx);
 
     if (copy_to_user(ubuf, kbuf, buf_len)) {
         kfree(kbuf);
@@ -187,20 +209,27 @@ static ssize_t litechr_write(struct file *pfile, const char *ubuf, size_t length
     int i;
     struct data_queue_entry_t *pnew_entry;
     
-    if (*poffset != 0)
-        return -ESPIPE;
+    //if (*poffset != 0)
+    //    return -ESPIPE;
     if (length == 0)
         return -EINVAL;
-    if (length > MAX_BUF_SIZE)
-        return -ENOBUFS;
     if (ubuf == NULL)
         return -EINVAL;
 
-    kbuf = kmalloc(MAX_BUF_SIZE, GFP_KERNEL);
-    if (kbuf == NULL)
+    mutex_lock(&data_queue_mtx);
+
+    if (length > MAX_BUF_SIZE - data_queue_size) {
+        mutex_unlock(&data_queue_mtx);
+        return -ENOBUFS;
+    }
+    kbuf = kmalloc(length, GFP_KERNEL);
+    if (kbuf == NULL) {
+        mutex_unlock(&data_queue_mtx);
         return -ENOMEM;
+    }
 
     if (copy_from_user(kbuf, ubuf, length)) {
+        mutex_unlock(&data_queue_mtx);
         kfree(kbuf);
         return -EFAULT;
     }
@@ -209,7 +238,8 @@ static ssize_t litechr_write(struct file *pfile, const char *ubuf, size_t length
     for (i = 0; i < length; ++i) {
         pnew_entry = kzalloc(sizeof(struct data_queue_entry_t), GFP_KERNEL);
         if (pnew_entry == NULL) {
-            kfree(kbuf);		
+	    mutex_unlock(&data_queue_mtx);
+            kfree(kbuf);
             return -ENOMEM;
         }
         pnew_entry->data_byte = kbuf[i];
@@ -217,9 +247,12 @@ static ssize_t litechr_write(struct file *pfile, const char *ubuf, size_t length
 	if (list_empty(&data_queue_head))
             pdata_queue_tail = &pnew_entry->entry_head;
 	list_add_tail(&pnew_entry->entry_head, &data_queue_head);
+	data_queue_size++;
 	pr_cont("%c (0x%02X) ", kbuf[i], kbuf[i]);
     }
     pr_info("");
+
+    mutex_unlock(&data_queue_mtx);
 
     kfree(kbuf);
 
